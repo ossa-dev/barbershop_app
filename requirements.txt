@@ -1,0 +1,7 @@
+streamlit>=1.32
+gspread>=6.0
+google-auth>=2.28
+google-api-python-client>=2.120
+Pillow>=10.2
+pandas>=2.2
+pytz>=2024.1
