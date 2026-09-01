@@ -6,8 +6,8 @@ import io
 
 from PIL import Image, ImageDraw, ImageFont
 
-MAX_LEBAR = 1080       # px, foto di-resize agar tidak terlalu besar tapi tetap jelas
-JPEG_QUALITY = 80       # 0-100, cukup jelas namun terkompresi
+MAX_LEBAR = 640        # px, foto di-resize agar tidak terlalu besar tapi tetap jelas
+JPEG_QUALITY = 55      # 0-100, dikompresi agresif untuk hemat penyimpanan Drive
 
 
 def _load_font(ukuran: int):

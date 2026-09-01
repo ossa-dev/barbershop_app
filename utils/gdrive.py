@@ -10,11 +10,30 @@ adalah membuat file "dimiliki" oleh akun Gmail-mu sendiri lewat OAuth
 refresh token (dibuat sekali lewat get_refresh_token.py), sehingga foto
 memakai kuota gratis 15GB akun Gmail-mu.
 
+PENTING - scope drive.file (bukan drive penuh):
+Scope ini dibatasi hanya bisa mengakses file/folder yang dibuat lewat
+aplikasi ini sendiri (lebih aman, tidak bisa melihat seluruh isi Drive
+akun Gmail-mu). Konsekuensi dari perubahan scope ini:
+
+1. Refresh token lama (dibuat waktu masih pakai scope drive penuh) tidak
+   berlaku lagi. Wajib jalankan ulang get_refresh_token.py dengan SCOPES
+   baru di bawah ini, lalu ganti st.secrets['gdrive_oauth']['refresh_token']
+   dengan token yang baru.
+2. Folder 'zza_barbershop' yang lama (dibuat waktu masih scope drive
+   penuh) kemungkinan tidak akan ketemu lagi lewat pencarian _cari_folder,
+   karena drive.file hanya bisa "melihat" file yang dibuat lewat app ini.
+   Kalau ingin tetap memakai folder lama itu, isi ID folder-nya secara
+   manual di st.secrets['gdrive_root_folder_id']. Kalau tidak diisi, app
+   akan otomatis membuat folder root baru saat pertama kali dipakai.
+
 Perlu di st.secrets:
     [gdrive_oauth]
     client_id = "..."
     client_secret = "..."
     refresh_token = "..."
+
+    # opsional, kalau mau tetap pakai folder root Drive yang sudah ada:
+    gdrive_root_folder_id = "..."
 """
 import io
 from typing import Optional
@@ -26,7 +45,7 @@ from googleapiclient.http import MediaIoBaseUpload
 
 from utils.format_utils import nama_folder_bulan, now_wib
 
-SCOPES = ["https://www.googleapis.com/auth/drive"]
+SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 ROOT_FOLDER_NAME = "zza_barbershop"
 ABSENSI_FOLDER_NAME = "absensi"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
@@ -75,18 +94,36 @@ def _cari_atau_buat_folder(service, nama: str, parent_id: Optional[str] = None) 
 
 @st.cache_resource(show_spinner=False)
 def _get_root_folder_id() -> str:
+    if "gdrive_root_folder_id" in st.secrets:
+        return st.secrets["gdrive_root_folder_id"]
     service = _get_service()
     return _cari_atau_buat_folder(service, ROOT_FOLDER_NAME, None)
 
 
-def get_folder_absensi_bulan_ini() -> str:
-    """Kembalikan folder id untuk Absensi/<tahun>/<bulan>, membuat jika belum ada."""
+@st.cache_resource(show_spinner=False)
+def _get_folder_absensi_tanggal(tahun: str, bulan: str, tanggal: str) -> str:
+    """
+    Folder id untuk Absensi/<tahun>/<bulan>/<tanggal>. Di-cache per kombinasi
+    tahun-bulan-tanggal supaya pencarian/pembuatan folder berjenjang (sekitar
+    4 request ke Drive API) cuma terjadi SEKALI per hari per proses app, bukan
+    setiap ada foto absen diunggah. Tanggal baru otomatis dibuatkan foldernya
+    sendiri saat pertama kali dipakai (cache key-nya beda).
+    """
     service = _get_service()
     root_id = _get_root_folder_id()
     absensi_id = _cari_atau_buat_folder(service, ABSENSI_FOLDER_NAME, root_id)
-    tahun_id = _cari_atau_buat_folder(service, str(now_wib().year), absensi_id)
-    bulan_id = _cari_atau_buat_folder(service, nama_folder_bulan(), tahun_id)
-    return bulan_id
+    tahun_id = _cari_atau_buat_folder(service, tahun, absensi_id)
+    bulan_id = _cari_atau_buat_folder(service, bulan, tahun_id)
+    tanggal_id = _cari_atau_buat_folder(service, tanggal, bulan_id)
+    return tanggal_id
+
+
+def get_folder_absensi_hari_ini() -> str:
+    """Kembalikan folder id untuk Absensi/<tahun>/<bulan>/<tanggal-hari-ini>, membuat jika belum ada."""
+    tahun = str(now_wib().year)
+    bulan = nama_folder_bulan()
+    tanggal = now_wib().strftime("%d")
+    return _get_folder_absensi_tanggal(tahun, bulan, tanggal)
 
 
 def upload_foto(file_bytes: bytes, filename: str, folder_id: str) -> str:
