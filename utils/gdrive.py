@@ -20,11 +20,13 @@ akun Gmail-mu). Konsekuensi dari perubahan scope ini:
    baru di bawah ini, lalu ganti st.secrets['gdrive_oauth']['refresh_token']
    dengan token yang baru.
 2. Folder 'zza_barbershop' yang lama (dibuat waktu masih scope drive
-   penuh) kemungkinan tidak akan ketemu lagi lewat pencarian _cari_folder,
-   karena drive.file hanya bisa "melihat" file yang dibuat lewat app ini.
-   Kalau ingin tetap memakai folder lama itu, isi ID folder-nya secara
-   manual di st.secrets['gdrive_root_folder_id']. Kalau tidak diisi, app
-   akan otomatis membuat folder root baru saat pertama kali dipakai.
+   penuh) TIDAK BISA dipakai lagi sama sekali lewat app ini -- bukan cuma
+   soal pencarian gagal. Scope drive.file hanya memberi akses ke file yang
+   dibuat oleh app ini sendiri (atau dipilih lewat Google Picker, yang
+   tidak dipakai di sini). Mengisi ID folder lama itu secara manual di
+   st.secrets['gdrive_root_folder_id'] TETAP AKAN GAGAL (403/404), karena
+   izin OAuth-nya memang tidak pernah diberikan untuk file itu. Folder
+   lama sepenuhnya orphaned -- app akan selalu bikin folder root BARU.
 
 Perlu di st.secrets:
     [gdrive_oauth]

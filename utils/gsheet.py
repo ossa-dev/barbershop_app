@@ -37,7 +37,7 @@ HEADERS = {
     SHEET_JASA: ["Nama_Jasa", "Harga", "Status"],
     SHEET_BAHAN: ["Nama_Bahan", "Satuan", "Stok_Saat_Ini", "Stok_Minimum", "Status"],
     SHEET_RESEP: ["Nama_Jasa", "Nama_Bahan", "Jumlah_Terpakai"],
-    SHEET_TRANSAKSI: ["ID_Transaksi", "Waktu", "Karyawan", "Nama_Jasa", "Harga", "Metode_Bayar"],
+    SHEET_TRANSAKSI: ["ID_Transaksi", "Waktu", "Karyawan", "Nama_Jasa", "Harga", "Metode_Bayar", "Nama_Pelanggan"],
     SHEET_PEMBELIAN: ["Waktu", "Karyawan", "Nama_Bahan", "Jumlah", "Total_Harga"],
     SHEET_TUTUP_KAS: ["Waktu", "Karyawan", "Tanggal", "Total_Tunai_Sistem", "Total_Tunai_Fisik", "Selisih"],
     SHEET_STOK_OPNAME: ["Waktu", "Nama_Bahan", "Stok_Sistem", "Stok_Fisik", "Selisih", "Keterangan"],
@@ -249,8 +249,10 @@ def get_absensi_df() -> pd.DataFrame:
 
 
 def karyawan_sedang_shift() -> list:
-    """Nama karyawan yang sudah Masuk hari ini tapi belum Pulang (untuk reminder owner)."""
-    df = _get_df(SHEET_ABSENSI)
+    """Nama karyawan yang sudah Masuk hari ini tapi belum Pulang (untuk reminder owner).
+    Pakai get_absensi_df() (cached) -- data yang sama persis sudah ditarik dengan aman
+    di baris 'Riwayat Absensi' dashboard, tidak perlu baca sheet dua kali."""
+    df = get_absensi_df()
     if df.empty:
         return []
     hari_ini = now_wib().strftime("%d-%m-%Y")
@@ -397,6 +399,7 @@ def _ubah_stok_bahan(nama_bahan: str, selisih: float):
     get_master_bahan_df.clear()
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def bahan_stok_menipis() -> pd.DataFrame:
     df = get_bahan_aktif()
     if df.empty:
@@ -444,48 +447,23 @@ def get_transaksi_df() -> pd.DataFrame:
     return _get_df(SHEET_TRANSAKSI)
 
 
-def transaksi_duplikat(nama_karyawan: str, nama_jasa: str, metode_bayar: str) -> bool:
-    """
-    Cegah transaksi ganda: tolak kalau ada transaksi persis sama (karyawan+jasa+metode)
-    yang tercatat dalam BATAS_DUPLIKAT_DETIK detik terakhir.
-    """
-    df = _get_df(SHEET_TRANSAKSI)
-    if df.empty:
-        return False
-    sekarang = now_wib()
-    for _, baris in df.tail(20).iterrows():
-        try:
-            waktu_baris = datetime.strptime(str(baris["Waktu"]), "%d-%m-%Y %H:%M:%S").replace(tzinfo=WIB)
-        except ValueError:
-            continue
-        sama = (
-            str(baris["Karyawan"]) == nama_karyawan
-            and str(baris["Nama_Jasa"]) == nama_jasa
-            and str(baris["Metode_Bayar"]) == metode_bayar
-        )
-        if sama and (sekarang - waktu_baris).total_seconds() <= BATAS_DUPLIKAT_DETIK:
-            return True
-    return False
-
-
-def catat_transaksi(nama_karyawan: str, nama_jasa: str, metode_bayar: str) -> dict:
+def catat_transaksi(nama_karyawan: str, nama_jasa: str, metode_bayar: str, nama_pelanggan: str = "") -> dict:
     """
     Catat 1 transaksi jasa: harga diambil sebagai snapshot dari Master_Jasa saat ini,
     stok bahan dikurangi sesuai Resep_Jasa (stok boleh minus kalau kurang, dikoreksi
-    lewat Stok_Opname), dan menolak kalau terdeteksi duplikat baru saja tersimpan.
-    """
-    if transaksi_duplikat(nama_karyawan, nama_jasa, metode_bayar):
-        return {
-            "berhasil": False,
-            "pesan": "Transaksi yang sama baru saja tercatat. Kemungkinan double-klik, tidak disimpan lagi.",
-        }
+    lewat Stok_Opname). nama_pelanggan opsional, boleh dikosongkan.
 
+    Pencegahan transaksi ganda TIDAK lagi dicek di sini (dulu lewat transaksi_duplikat()
+    yang download seluruh Log_Transaksi tiap klik tombol Simpan -- boros API). Sekarang
+    dicek di app.py pakai st.session_state (lokal, tanpa baca sheet sama sekali) SEBELUM
+    fungsi ini dipanggil. Fungsi ini murni "simpan", tidak lagi merangkap validasi duplikat.
+    """
     harga = _harga_jasa_fresh(nama_jasa)
     id_transaksi = f"TX-{now_wib().strftime('%Y%m%d%H%M%S%f')}"
     waktu = now_wib().strftime("%d-%m-%Y %H:%M:%S")
 
     ws = _get_ws(SHEET_TRANSAKSI)
-    ws.append_row([id_transaksi, waktu, nama_karyawan, nama_jasa, harga, metode_bayar])
+    ws.append_row([id_transaksi, waktu, nama_karyawan, nama_jasa, harga, metode_bayar, nama_pelanggan])
     get_transaksi_df.clear()
 
     resep = get_resep_untuk_jasa(nama_jasa)
@@ -500,8 +478,11 @@ def catat_transaksi(nama_karyawan: str, nama_jasa: str, metode_bayar: str) -> di
 
 
 def total_tunai_karyawan(nama_karyawan: str, tanggal: str) -> float:
-    """tanggal format dd-mm-YYYY. Total transaksi Tunai milik karyawan pada tanggal itu."""
-    df = _get_df(SHEET_TRANSAKSI)
+    """tanggal format dd-mm-YYYY. Total transaksi Tunai milik karyawan pada tanggal itu.
+    Pakai get_transaksi_df() (cached) bukan _get_df() langsung -- aman dari sisi
+    keakuratan karena catat_transaksi() selalu memanggil get_transaksi_df.clear()
+    tiap ada transaksi baru, jadi cache tidak pernah basi saat dipakai di sini."""
+    df = get_transaksi_df()
     if df.empty:
         return 0
     df["_tgl"] = df["Waktu"].astype(str).str[:10]
@@ -509,21 +490,6 @@ def total_tunai_karyawan(nama_karyawan: str, tanggal: str) -> float:
         (df["Karyawan"] == nama_karyawan)
         & (df["_tgl"] == tanggal)
         & (df["Metode_Bayar"] == "Tunai")
-    ]
-    if cocok.empty:
-        return 0
-    return float(pd.to_numeric(cocok["Harga"], errors="coerce").fillna(0).sum())
-
-
-def total_non_tunai_karyawan(nama_karyawan: str, tanggal: str) -> float:
-    df = _get_df(SHEET_TRANSAKSI)
-    if df.empty:
-        return 0
-    df["_tgl"] = df["Waktu"].astype(str).str[:10]
-    cocok = df[
-        (df["Karyawan"] == nama_karyawan)
-        & (df["_tgl"] == tanggal)
-        & (df["Metode_Bayar"] == "Non-tunai")
     ]
     if cocok.empty:
         return 0

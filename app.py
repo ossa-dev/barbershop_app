@@ -1,3 +1,5 @@
+import time
+
 import pandas as pd
 import streamlit as st
 
@@ -53,8 +55,16 @@ def _form_login_pin(nama: str) -> bool:
     return st.session_state.get("pin_ok", False)
 
 
-def _form_transaksi_jasa(nama: str):
+def _form_transaksi_jasa(nama: str, kas_sudah_ditutup: bool):
     st.subheader("Catat Transaksi Jasa")
+
+    if kas_sudah_ditutup:
+        st.info(
+            "Kas hari ini sudah ditutup, jadi tidak bisa tambah transaksi baru. "
+            "Kalau memang masih ada pelanggan setelah ini, hubungi pemilik untuk koreksi manual."
+        )
+        return
+
     df_jasa = gsheet.get_jasa_aktif()
     if df_jasa.empty:
         st.info("Belum ada Master_Jasa yang aktif. Minta pemilik menambahkan jasa dulu.")
@@ -63,15 +73,40 @@ def _form_transaksi_jasa(nama: str):
     nama_jasa = st.selectbox("Jasa", df_jasa["Nama_Jasa"].tolist(), key="pilih_jasa")
     harga = gsheet.harga_jasa(nama_jasa)
     st.write(f"Harga: **{format_rupiah(harga)}**")
+
+    # Poin 3: peringatan stok kritis, tepat di bawah pilihan jasa. bahan_stok_menipis()
+    # sudah di-cache (ttl 30 detik) jadi aman dipanggil di sini tiap rerun.
+    df_menipis = gsheet.bahan_stok_menipis()
+    if not df_menipis.empty:
+        st.warning(f"⚠️ Stok menipis: {', '.join(df_menipis['Nama_Bahan'].tolist())}. Info ke pemilik untuk restock.")
+
+    nama_pelanggan = st.text_input("Nama Pelanggan (opsional)", key="nama_pelanggan_transaksi")
     metode = st.radio("Metode Bayar", ["Tunai", "Non-tunai"], key="metode_bayar", horizontal=True)
 
     if st.button("Simpan Transaksi", key="btn_simpan_transaksi"):
-        with st.spinner("Menyimpan transaksi..."):
-            hasil = gsheet.catat_transaksi(nama, nama_jasa, metode)
-        if hasil["berhasil"]:
-            st.success(hasil["pesan"])
+        # Poin 2: cek transaksi ganda LOKAL via session_state, tidak baca sheet sama
+        # sekali (dulu lewat gsheet.transaksi_duplikat() yang download seluruh
+        # Log_Transaksi tiap klik -- sekarang dihapus dari gsheet.py).
+        terakhir = st.session_state.get("_transaksi_terakhir")
+        sekarang = time.time()
+        adalah_duplikat = (
+            terakhir is not None
+            and terakhir["jasa"] == nama_jasa
+            and terakhir["metode"] == metode
+            and (sekarang - terakhir["waktu"]) <= gsheet.BATAS_DUPLIKAT_DETIK
+        )
+        if adalah_duplikat:
+            st.warning("Transaksi yang sama baru saja tercatat. Kemungkinan double-klik, tidak disimpan lagi.")
         else:
-            st.warning(hasil["pesan"])
+            with st.spinner("Menyimpan transaksi..."):
+                hasil = gsheet.catat_transaksi(nama, nama_jasa, metode, nama_pelanggan)
+            if hasil["berhasil"]:
+                st.session_state["_transaksi_terakhir"] = {
+                    "jasa": nama_jasa, "metode": metode, "waktu": sekarang,
+                }
+                st.success(hasil["pesan"])
+            else:
+                st.warning(hasil["pesan"])
 
 
 def _form_pembelian_bahan(nama: str):
@@ -166,8 +201,10 @@ def halaman_karyawan():
         st.info(f"{nama} sudah tercatat Masuk & Pulang hari ini. Sampai jumpa besok!")
         return
 
+    tutup_kas_selesai = gsheet.sudah_tutup_kas_hari_ini(nama)
+
     st.divider()
-    _form_transaksi_jasa(nama)
+    _form_transaksi_jasa(nama, tutup_kas_selesai)
     _form_pembelian_bahan(nama)
     st.divider()
 
@@ -176,8 +213,6 @@ def halaman_karyawan():
         return
 
     # status_berikutnya == "Pulang"
-    tutup_kas_selesai = gsheet.sudah_tutup_kas_hari_ini(nama)
-
     if not tutup_kas_selesai:
         with st.expander("Tutup kas (boleh diisi kapan saja sebelum pulang)"):
             _form_tutup_kas(nama, wajib=False)
@@ -255,7 +290,7 @@ def _tab_master_data():
         st.subheader("Master Jasa")
         df_jasa = gsheet.get_master_jasa_df()
         if not df_jasa.empty:
-            st.dataframe(df_jasa, use_container_width=True, hide_index=True)
+            st.dataframe(df_jasa, width="stretch", hide_index=True)
 
         with st.form("form_tambah_jasa", clear_on_submit=True):
             nama_jasa = st.text_input("Nama Jasa")
@@ -282,7 +317,7 @@ def _tab_master_data():
         st.subheader("Master Bahan")
         df_bahan = gsheet.get_master_bahan_df()
         if not df_bahan.empty:
-            st.dataframe(df_bahan, use_container_width=True, hide_index=True)
+            st.dataframe(df_bahan, width="stretch", hide_index=True)
 
         with st.form("form_tambah_bahan", clear_on_submit=True):
             nama_bahan = st.text_input("Nama Bahan")
@@ -315,7 +350,7 @@ def _tab_master_data():
         st.subheader("Resep Jasa (Bahan yang Terpakai per Jasa)")
         df_resep = gsheet.get_resep_df()
         if not df_resep.empty:
-            st.dataframe(df_resep, use_container_width=True, hide_index=True)
+            st.dataframe(df_resep, width="stretch", hide_index=True)
         else:
             st.info("Belum ada resep. Jasa tanpa resep dianggap tidak memakai bahan apa pun.")
 
@@ -339,19 +374,26 @@ def _tab_master_data():
 
 
 def _tab_dashboard():
+    # Poin 1: tombol refresh manual. st.rerun() tidak menghapus login/cache -- cache
+    # ttl=30 di gsheet.py tetap dihormati (kalau data belum lewat 30 detik, tetap
+    # dari cache, bukan baca ulang API), ini murni memudahkan owner "tekan sekali
+    # untuk lihat data terbaru" tanpa perlu klik menu lain dulu.
+    if st.button("🔄 Segarkan Laporan"):
+        st.rerun()
+
     st.subheader("Riwayat Absensi")
     df_absensi = gsheet.get_absensi_df()
-    if df_absensi.empty:
-        st.info("Belum ada data absensi.")
-    else:
-        st.dataframe(df_absensi, use_container_width=True, hide_index=True)
-
     sedang_shift = gsheet.karyawan_sedang_shift()
     belum_tutup_kas = [nama for nama in sedang_shift if not gsheet.sudah_tutup_kas_hari_ini(nama)]
     if sedang_shift:
         st.write(f"Karyawan yang sedang shift (sudah Masuk, belum Pulang): {', '.join(sedang_shift)}")
     if belum_tutup_kas:
         st.warning(f"Pengingat: belum tutup kas hari ini -> {', '.join(belum_tutup_kas)}")
+    with st.expander("Lihat tabel Riwayat Absensi"):
+        if df_absensi.empty:
+            st.info("Belum ada data absensi.")
+        else:
+            st.dataframe(df_absensi, width="stretch", hide_index=True)
 
     st.divider()
     st.subheader("Riwayat Keuangan")
@@ -359,9 +401,10 @@ def _tab_dashboard():
     if df_keuangan.empty:
         st.info("Belum ada data keuangan.")
     else:
-        df_tampil = df_keuangan.copy()
-        df_tampil["Nominal"] = df_tampil["Nominal"].apply(format_rupiah)
-        st.dataframe(df_tampil, use_container_width=True, hide_index=True)
+        with st.expander("Lihat tabel Riwayat Keuangan"):
+            df_tampil = df_keuangan.copy()
+            df_tampil["Nominal"] = df_tampil["Nominal"].apply(format_rupiah)
+            st.dataframe(df_tampil, width="stretch", hide_index=True)
 
         st.subheader("Grafik Pendapatan Harian (Keuangan)")
         df_pemasukan = df_keuangan[df_keuangan["Jenis"] == "Pemasukan"]
@@ -372,47 +415,53 @@ def _tab_dashboard():
     st.divider()
     st.subheader("Riwayat Transaksi Jasa")
     df_transaksi = gsheet.get_transaksi_df()
-    if df_transaksi.empty:
-        st.info("Belum ada transaksi jasa.")
-    else:
-        df_transaksi_tampil = df_transaksi.copy()
-        df_transaksi_tampil["Harga"] = df_transaksi_tampil["Harga"].apply(format_rupiah)
-        st.dataframe(df_transaksi_tampil, use_container_width=True, hide_index=True)
+    with st.expander("Lihat tabel Riwayat Transaksi Jasa"):
+        if df_transaksi.empty:
+            st.info("Belum ada transaksi jasa.")
+        else:
+            df_transaksi_tampil = df_transaksi.copy()
+            df_transaksi_tampil["Harga"] = df_transaksi_tampil["Harga"].apply(format_rupiah)
+            st.dataframe(df_transaksi_tampil, width="stretch", hide_index=True)
 
     st.divider()
     st.subheader("Rekap Kas per Karyawan (Tutup Kas)")
     df_kas = gsheet.get_tutup_kas_df()
-    if df_kas.empty:
-        st.info("Belum ada data tutup kas.")
-    else:
-        df_kas_tampil = df_kas.copy()
-        for kolom in ["Total_Tunai_Sistem", "Total_Tunai_Fisik", "Selisih"]:
-            df_kas_tampil[kolom] = df_kas_tampil[kolom].apply(format_rupiah)
-        st.dataframe(df_kas_tampil, use_container_width=True, hide_index=True)
+    with st.expander("Lihat tabel Rekap Kas per Karyawan"):
+        if df_kas.empty:
+            st.info("Belum ada data tutup kas.")
+        else:
+            df_kas_tampil = df_kas.copy()
+            for kolom in ["Total_Tunai_Sistem", "Total_Tunai_Fisik", "Selisih"]:
+                df_kas_tampil[kolom] = df_kas_tampil[kolom].apply(format_rupiah)
+            st.dataframe(df_kas_tampil, width="stretch", hide_index=True)
 
     st.subheader("Rekap Non-Tunai per Karyawan")
-    if not df_transaksi.empty:
-        df_non_tunai = df_transaksi[df_transaksi["Metode_Bayar"] == "Non-tunai"].copy()
-        if df_non_tunai.empty:
-            st.info("Belum ada transaksi non-tunai.")
+    with st.expander("Lihat tabel Rekap Non-Tunai"):
+        if not df_transaksi.empty:
+            df_non_tunai = df_transaksi[df_transaksi["Metode_Bayar"] == "Non-tunai"].copy()
+            if df_non_tunai.empty:
+                st.info("Belum ada transaksi non-tunai.")
+            else:
+                df_non_tunai["_tgl"] = df_non_tunai["Waktu"].astype(str).str[:10]
+                df_non_tunai["Harga"] = pd.to_numeric(df_non_tunai["Harga"], errors="coerce").fillna(0)
+                rekap_non_tunai = df_non_tunai.groupby(["Karyawan", "_tgl"])["Harga"].sum().reset_index()
+                rekap_non_tunai = rekap_non_tunai.rename(columns={"_tgl": "Tanggal"})
+                rekap_non_tunai["Harga"] = rekap_non_tunai["Harga"].apply(format_rupiah)
+                st.dataframe(rekap_non_tunai, width="stretch", hide_index=True)
         else:
-            df_non_tunai["_tgl"] = df_non_tunai["Waktu"].astype(str).str[:10]
-            df_non_tunai["Harga"] = pd.to_numeric(df_non_tunai["Harga"], errors="coerce").fillna(0)
-            rekap_non_tunai = df_non_tunai.groupby(["Karyawan", "_tgl"])["Harga"].sum().reset_index()
-            rekap_non_tunai = rekap_non_tunai.rename(columns={"_tgl": "Tanggal"})
-            rekap_non_tunai["Harga"] = rekap_non_tunai["Harga"].apply(format_rupiah)
-            st.dataframe(rekap_non_tunai, use_container_width=True, hide_index=True)
+            st.info("Belum ada transaksi non-tunai.")
 
     st.divider()
     st.subheader("Status Stok Bahan")
     df_bahan_semua = gsheet.get_master_bahan_df()
-    if df_bahan_semua.empty:
-        st.info("Belum ada Master_Bahan.")
-    else:
-        st.dataframe(df_bahan_semua, use_container_width=True, hide_index=True)
-        df_menipis = gsheet.bahan_stok_menipis()
-        if not df_menipis.empty:
-            st.warning(f"Stok menipis: {', '.join(df_menipis['Nama_Bahan'].tolist())}")
+    df_menipis = gsheet.bahan_stok_menipis()
+    if not df_bahan_semua.empty and not df_menipis.empty:
+        st.warning(f"Stok menipis: {', '.join(df_menipis['Nama_Bahan'].tolist())}")
+    with st.expander("Lihat tabel Status Stok Bahan"):
+        if df_bahan_semua.empty:
+            st.info("Belum ada Master_Bahan.")
+        else:
+            st.dataframe(df_bahan_semua, width="stretch", hide_index=True)
 
     st.subheader("Stok Opname (Koreksi Stok Fisik)")
     df_bahan_aktif = gsheet.get_bahan_aktif()
@@ -435,12 +484,13 @@ def _tab_dashboard():
     st.divider()
     st.subheader("Riwayat Pola Selisih per Karyawan")
     df_pola = gsheet.rekap_pola_selisih()
-    if df_pola is None or df_pola.empty:
-        st.info("Belum ada data selisih.")
-    else:
-        df_pola_tampil = df_pola.copy()
-        df_pola_tampil["Total_Selisih"] = df_pola_tampil["Total_Selisih"].apply(format_rupiah)
-        st.dataframe(df_pola_tampil, use_container_width=True, hide_index=True)
+    with st.expander("Lihat tabel Pola Selisih"):
+        if df_pola is None or df_pola.empty:
+            st.info("Belum ada data selisih.")
+        else:
+            df_pola_tampil = df_pola.copy()
+            df_pola_tampil["Total_Selisih"] = df_pola_tampil["Total_Selisih"].apply(format_rupiah)
+            st.dataframe(df_pola_tampil, width="stretch", hide_index=True)
 
     st.subheader("Utang Selisih (Belum Lunas)")
     df_utang = gsheet.get_utang_df()
@@ -451,9 +501,10 @@ def _tab_dashboard():
         if df_belum_lunas.empty:
             st.info("Semua utang selisih sudah lunas.")
         else:
-            df_belum_lunas_tampil = df_belum_lunas.copy()
-            df_belum_lunas_tampil["Jumlah"] = df_belum_lunas_tampil["Jumlah"].apply(format_rupiah)
-            st.dataframe(df_belum_lunas_tampil, use_container_width=True, hide_index=True)
+            with st.expander("Lihat tabel Utang Selisih Belum Lunas", expanded=True):
+                df_belum_lunas_tampil = df_belum_lunas.copy()
+                df_belum_lunas_tampil["Jumlah"] = df_belum_lunas_tampil["Jumlah"].apply(format_rupiah)
+                st.dataframe(df_belum_lunas_tampil, width="stretch", hide_index=True)
 
             pilihan = [f"{row['Waktu']} | {row['Karyawan']}" for _, row in df_belum_lunas.iterrows()]
             baris_pilih = st.selectbox("Tandai lunas (Waktu | Karyawan)", pilihan, key="pilih_lunas")
